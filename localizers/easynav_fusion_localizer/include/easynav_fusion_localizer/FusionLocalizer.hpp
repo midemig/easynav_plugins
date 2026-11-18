@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <memory>
 #include <vector>
@@ -61,6 +62,26 @@ protected:
   /// @brief Last known pose, applied once the global filter has an estimate.
   std::optional<geometry_msgs::msg::PoseWithCovarianceStamped> pending_last_pose_;
 
+  /// @brief Pose from /initialpose, applied in the RT cycle (which owns the filters).
+  std::optional<geometry_msgs::msg::PoseWithCovarianceStamped> pending_init_pose_;
+
+  /// @brief Guards the pending poses, set from other threads.
+  std::mutex pending_mutex_;
+
+  /// @brief Whether /initialpose moves the GNSS frame so that the current GNSS position maps to
+  /// the pose ("initial_pose.shift_gnss_origin"); off when the poses are already in the
+  /// georeferenced map frame.
+  bool shift_gnss_origin_ {true};
+
+  /// @brief Stamp of the last pose taken from the NavState key "localizer.reset_pose".
+  rclcpp::Time last_reset_stamp_ {0, 0, RCL_ROS_TIME};
+
+  /// @brief Takes @p pose (with its covariance) in the global filter, and in the local one with
+  /// @p local; with @p shift_origin, the GNSS frame is moved first so that the current GNSS
+  /// position maps to it. Called in the RT cycle.
+  void apply_pose_(
+    const geometry_msgs::msg::PoseWithCovarianceStamped & pose, bool shift_origin, bool local);
+
 protected:
   /**
    * @brief Hook de inicialización de MethodBase.
@@ -91,6 +112,10 @@ protected:
 private:
   std::unique_ptr<robot_localization::UkfWrapper> ukf_local_{nullptr};
   std::unique_ptr<robot_localization::UkfWrapper> ukf_global_{nullptr};
+  /// A localizer plugin as the global stage instead of the UKF ("global_filter.plugin"), with
+  /// its parameters under "<name>.global_filter": it gets the NavState after the local filter
+  /// ("robot_pose_local") and publishes "robot_pose" and map -> odom itself.
+  std::shared_ptr<LocalizerMethodBase> global_stage_;
 
   bool has_global_filter_{false};
   bool has_local_filter_{false};

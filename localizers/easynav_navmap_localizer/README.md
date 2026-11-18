@@ -36,6 +36,7 @@ All parameters are declared under the plugin name namespace, i.e., `/<node_fqn>/
 | `<plugin>.num_particles` | `int` | `100` | Number of AMCL particles. |
 | `<plugin>.initial_pose.x` | `double` | `0.0` | Initial X position (m). |
 | `<plugin>.initial_pose.y` | `double` | `0.0` | Initial Y position (m). |
+| `<plugin>.initial_pose.z` | `double` | `0.0` | Initial height (m): picks the surface (floor) the robot starts on. |
 | `<plugin>.initial_pose.yaw` | `double` | `0.0` | Initial yaw (rad). |
 | `<plugin>.initial_pose.std_dev_xy` | `double` | `0.5` | Std dev used to sample initial X/Y. |
 | `<plugin>.initial_pose.std_dev_yaw` | `double` | `0.5` | Std dev used to sample initial yaw. |

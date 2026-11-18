@@ -32,6 +32,8 @@
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "pcl/point_cloud.h"
+#include "pcl/point_types.h"
 #include "tf2/LinearMath/Transform.hpp"
 #include "tf2_ros/transform_broadcaster.hpp"
 #include "navmap_core/NavMap.hpp"
@@ -53,6 +55,16 @@ struct Particle
   ::navmap::NavCelId last_cid = std::numeric_limits<uint32_t>::max();
   std::size_t last_surface = 0;
   double odom_scale = 1.0;    ///< Scale of the odometry's translation for it (< 1: slipping)
+};
+
+/// \brief A sensor's cloud as correct() scores it: filtered, in the sensor frame, with the
+/// sensor where it was when it took the cloud, in today's footprint.
+struct SensorBundle
+{
+  std::string frame_id;
+  rclcpp::Time stamp;
+  tf2::Transform T_bf_sensor;
+  pcl::PointCloud<pcl::PointXYZ> cloud;
 };
 
 /// \brief A localization method implementing a simplified AMCL (Adaptive Monte Carlo Localization)
@@ -186,7 +198,9 @@ protected:
 
   /// Spreads the particles around @p msg. With @p handover, their poses go to the RT thread
   /// (see pending_); without it they are written here, only valid while neither thread runs.
-  void reinitialize_(const geometry_msgs::msg::PoseWithCovarianceStamped & msg, bool handover);
+  void reinitialize_(
+    const geometry_msgs::msg::PoseWithCovarianceStamped & msg, bool handover,
+    double fraction = 1.0);
 
   /// @brief Starts from the last known pose after a reconfiguration
   /// ("initial_pose.use_last_known").
@@ -194,6 +208,32 @@ protected:
 
   /// @brief Whether to start from the last known pose after a reconfiguration.
   bool use_last_known_pose_ {true};
+
+  /// @brief Whether to publish map -> odom (TF and RTTFBuffer): off when another plugin hosts
+  /// this one and publishes it ("publish_tf").
+  bool publish_tf_ {true};
+
+  /// @brief Stamp of the last pose taken from the NavState key "localizer.reset_pose".
+  rclcpp::Time last_reset_stamp_ {0, 0, RCL_ROS_TIME};
+
+  /// @brief Hints from a hosting plugin (NavState key "localizer.pose_hint"): this fraction of
+  /// the particles, the lightest, are drawn around the pose ("hint_fraction").
+  double hint_fraction_ {0.3};
+  rclcpp::Time last_hint_stamp_ {0, 0, RCL_ROS_TIME};
+
+  /// @brief How well the scan fits the map at the best particles (fraction of hits, last
+  /// correction), published as the NavState key "localizer.quality".
+  double quality_ {std::numeric_limits<double>::quiet_NaN()};
+
+  /// @brief Fit queries from a hosting plugin: the NavState key "localizer.fit_poses"
+  /// (geometry_msgs/PoseArray, stamped when the poses were taken) is answered in
+  /// "localizer.fit" (std_msgs/Float64MultiArray: the request's stamp, then the fraction of the
+  /// last scored clouds' hits at each pose, moved by the odometry since the stamp), with the
+  /// clouds correct() last scored.
+  std::vector<SensorBundle> fit_bundles_;
+  int fit_tail_skip_ {-1};
+  rclcpp::Time last_fit_stamp_ {0, 0, RCL_ROS_TIME};
+  void answer_fit_(NavState & nav_state);
 
   /**
    * @brief Update odom from TFs instead of a odom topic

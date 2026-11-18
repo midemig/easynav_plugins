@@ -23,6 +23,7 @@
 #include "easynav_sensors/types/IMUPerception.hpp"
 #include "easynav_sensors/types/GNSSPerception.hpp"
 #include "navmap_core/NavMap.hpp"
+#include "pluginlib/class_loader.hpp"
 #include "sensor_msgs/msg/nav_sat_status.hpp"
 
 #include <GeographicLib/UTMUPS.hpp>
@@ -54,6 +55,9 @@ void FusionLocalizer::on_initialize()
       use_last_known_pose_);
     node->get_parameter(plugin_name + ".initial_pose.use_last_known", use_last_known_pose_);
     easynav::declare_parameter_if_absent<bool>(
+      *node, plugin_name + ".initial_pose.shift_gnss_origin", shift_gnss_origin_);
+    node->get_parameter(plugin_name + ".initial_pose.shift_gnss_origin", shift_gnss_origin_);
+    easynav::declare_parameter_if_absent<bool>(
       *node, plugin_name + ".navmap_terrain", navmap_terrain_);
     node->get_parameter(plugin_name + ".navmap_terrain", navmap_terrain_);
 
@@ -84,7 +88,22 @@ void FusionLocalizer::on_initialize()
       }
     }
 
-    if (!has_global_filter_ && !has_local_filter_) {
+    // The global stage may be another localizer plugin instead of the UKF
+    std::string global_plugin;
+    easynav::declare_parameter_if_absent(*node, global_prefix + "plugin", global_plugin);
+    node->get_parameter(global_prefix + "plugin", global_plugin);
+    if (!global_plugin.empty()) {
+      // Never destroyed: plugin libraries register NavState printers that must stay loaded
+      static auto * loader = new pluginlib::ClassLoader<LocalizerMethodBase>(
+        "easynav_core", "easynav::LocalizerMethodBase");
+      global_stage_ = loader->createSharedInstance(global_plugin);
+      global_stage_->initialize(node, plugin_name + ".global_filter");
+      has_global_filter_ = false;
+      RCLCPP_INFO(
+        localizer_node->get_logger(), "Global stage: %s", global_plugin.c_str());
+    }
+
+    if (!has_global_filter_ && !has_local_filter_ && !global_stage_) {
       RCLCPP_FATAL(
         localizer_node->get_logger(),
         "No parameters found for either '%s' or '%s'. "
@@ -169,6 +188,7 @@ void FusionLocalizer::on_last_known_pose(
 {
   // Only the global filter estimates the pose in the map frame ("robot_pose").
   if (use_last_known_pose_ && has_global_filter_) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_last_pose_ = pose;
   }
 }
@@ -176,12 +196,20 @@ void FusionLocalizer::on_last_known_pose(
 void FusionLocalizer::init_pose_callback(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
   pending_last_pose_.reset();  // A newer pose supersedes the last known one.
+  pending_init_pose_ = *msg;
+}
+
+void FusionLocalizer::apply_pose_(
+  const geometry_msgs::msg::PoseWithCovarianceStamped & pose, bool shift_origin, bool local)
+{
+  auto msg = std::make_shared<geometry_msgs::msg::PoseWithCovarianceStamped>(pose);
   terrain_.set_height_hint(msg->pose.pose.position.z);
   if (has_global_filter_) {
     nav_msgs::msg::Odometry global_odom;
     // Get current position to calculate the offset
-    if (ukf_global_->getFilteredOdometryMessage(&global_odom)) {
+    if (shift_origin && ukf_global_->getFilteredOdometryMessage(&global_odom)) {
       double current_x = global_odom.pose.pose.position.x;
       double current_y = global_odom.pose.pose.position.y;
 
@@ -201,7 +229,7 @@ void FusionLocalizer::init_pose_callback(
     first_pose_received_ = true;
   }
 
-  if (has_local_filter_) {
+  if (local && has_local_filter_) {
     ukf_local_->setPoseCallback(msg);
   }
 }
@@ -209,6 +237,31 @@ void FusionLocalizer::init_pose_callback(
 void FusionLocalizer::update_rt(NavState & nav_state)
 {
   const auto & tf_info = RTTFBuffer::getInstance()->get_tf_info();
+
+  // A pose handed over by a plugin hosting this one, already in the georeferenced map frame:
+  // each new stamp is a new reset
+  if (nav_state.has("localizer.reset_pose")) {
+    const auto & reset =
+      nav_state.get<geometry_msgs::msg::PoseWithCovarianceStamped>("localizer.reset_pose");
+    const rclcpp::Time stamp(reset.header.stamp, RCL_ROS_TIME);
+    if (stamp > last_reset_stamp_) {
+      last_reset_stamp_ = stamp;
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_last_pose_.reset();
+      }
+      apply_pose_(reset, false, false);  // the local filter keeps its odom frame
+    }
+  }
+
+  std::optional<geometry_msgs::msg::PoseWithCovarianceStamped> init_pose;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    init_pose.swap(pending_init_pose_);
+  }
+  if (init_pose) {
+    apply_pose_(*init_pose, shift_gnss_origin_, true);
+  }
 
   if (has_global_filter_) {
     terrain_nav_state_ = &nav_state;
@@ -253,10 +306,14 @@ void FusionLocalizer::update_rt(NavState & nav_state)
     ukf_global_->periodicUpdate();
 
     nav_msgs::msg::Odometry global_odom;
-    if (pending_last_pose_ && ukf_global_->getFilteredOdometryMessage(&global_odom)) {
-      init_pose_callback(
-        std::make_shared<geometry_msgs::msg::PoseWithCovarianceStamped>(*pending_last_pose_));
-      pending_last_pose_.reset();
+    std::optional<geometry_msgs::msg::PoseWithCovarianceStamped> last_pose;
+    if (ukf_global_->getFilteredOdometryMessage(&global_odom)) {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      last_pose.swap(pending_last_pose_);
+    }
+    if (last_pose) {
+      // In the map frame already: it must not move the GNSS frame
+      apply_pose_(*last_pose, false, true);
     }
     if (ukf_global_->getFilteredOdometryMessage(&global_odom)) {
       if (navmap_terrain_) {
@@ -275,10 +332,17 @@ void FusionLocalizer::update_rt(NavState & nav_state)
       nav_state.set("robot_pose_local", local_odom);
     }
   }
+
+  if (global_stage_) {
+    global_stage_->internal_update_rt(nav_state, true);
+  }
 }
 
 void FusionLocalizer::update([[maybe_unused]] NavState & nav_state)
 {
+  if (global_stage_) {
+    global_stage_->internal_update(nav_state);
+  }
 }
 
 void FusionLocalizer::place_on_terrain(nav_msgs::msg::Odometry & odom)

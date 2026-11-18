@@ -30,6 +30,7 @@
 
 #include "pcl/point_cloud.h"
 #include "pcl/point_types.h"
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include "bonxai/bonxai.hpp"
 #include "bonxai/probabilistic_map.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -374,12 +375,15 @@ void AMCLLocalizer::on_initialize()
   const auto & plugin_name = get_plugin_name();
 
   int num_particles = 100;
-  double x_init = 0.0, y_init = 0.0, yaw_init = 0.0, std_dev_xy = 0.5, std_dev_yaw = 0.5;
+  double x_init = 0.0, y_init = 0.0, z_init = 0.0, yaw_init = 0.0;
+  double std_dev_xy = 0.5, std_dev_yaw = 0.5;
   std::string perception_model;
 
   easynav::declare_parameter_if_absent<int>(*node, plugin_name + ".num_particles", 100);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".initial_pose.x", 0.0);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".initial_pose.y", 0.0);
+  // The height picks the surface the robot starts on (maps with more than one floor)
+  easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".initial_pose.z", 0.0);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".initial_pose.yaw", 0.0);
   easynav::declare_parameter_if_absent<double>(
     *node, plugin_name + ".initial_pose.std_dev_xy",
@@ -396,6 +400,8 @@ void AMCLLocalizer::on_initialize()
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".min_noise_xy", 0.05);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".min_noise_yaw", 0.05);
   easynav::declare_parameter_if_absent<bool>(*node, plugin_name + ".compute_odom_from_tf", false);
+  easynav::declare_parameter_if_absent<bool>(*node, plugin_name + ".publish_tf", publish_tf_);
+  easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".hint_fraction", hint_fraction_);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".inflation_stddev", 0.05);
   easynav::declare_parameter_if_absent<double>(*node, plugin_name + ".inflation_prob_min", 0.01);
   easynav::declare_parameter_if_absent<int>(*node, plugin_name + ".correct_max_points", 1500);
@@ -416,6 +422,7 @@ void AMCLLocalizer::on_initialize()
   node->get_parameter<int>(plugin_name + ".num_particles", num_particles);
   node->get_parameter<double>(plugin_name + ".initial_pose.x", x_init);
   node->get_parameter<double>(plugin_name + ".initial_pose.y", y_init);
+  node->get_parameter<double>(plugin_name + ".initial_pose.z", z_init);
   node->get_parameter<double>(plugin_name + ".initial_pose.yaw", yaw_init);
   node->get_parameter<double>(plugin_name + ".initial_pose.std_dev_xy", std_dev_xy);
   node->get_parameter<double>(plugin_name + ".initial_pose.std_dev_yaw", std_dev_yaw);
@@ -431,6 +438,8 @@ void AMCLLocalizer::on_initialize()
   node->get_parameter<double>(plugin_name + ".min_noise_xy", min_noise_xy_);
   node->get_parameter<double>(plugin_name + ".min_noise_yaw", min_noise_yaw_);
   node->get_parameter<bool>(plugin_name + ".compute_odom_from_tf", compute_odom_from_tf_);
+  node->get_parameter<bool>(plugin_name + ".publish_tf", publish_tf_);
+  node->get_parameter<double>(plugin_name + ".hint_fraction", hint_fraction_);
   node->get_parameter<std::string>(plugin_name + ".perception_model", perception_model);
 
   node->get_parameter<double>(plugin_name + ".inflation_stddev", inflation_stddev_);
@@ -531,7 +540,7 @@ void AMCLLocalizer::on_initialize()
   for (auto & p : particles_) {
     tf2::Quaternion q; q.setRPY(0.0, 0.0, noise_yaw(rng_));
     p.pose.setRotation(q);
-    p.pose.setOrigin(tf2::Vector3(noise_x(rng_), noise_y(rng_), 0.0));
+    p.pose.setOrigin(tf2::Vector3(noise_x(rng_), noise_y(rng_), z_init));
     p.hits = 0; p.possible_hits = 0; p.weight = 1.0 / num_particles;
   }
 
@@ -593,7 +602,7 @@ AMCLLocalizer::init_pose_callback(
 
 void
 AMCLLocalizer::reinitialize_(
-  const geometry_msgs::msg::PoseWithCovarianceStamped & in, bool handover)
+  const geometry_msgs::msg::PoseWithCovarianceStamped & in, bool handover, double fraction)
 {
   if (particles_.empty()) {
     return;
@@ -615,7 +624,11 @@ AMCLLocalizer::reinitialize_(
   }
 
   last_input_time_ = msg->header.stamp;
-  w_slow_ = w_fast_ = 0.0;  // a new belief: the likelihood averages start again
+  // A hint (fraction < 1) adds hypotheses to the belief: only the lightest particles move
+  const bool hint = fraction < 1.0;
+  if (!hint) {
+    w_slow_ = w_fast_ = 0.0;  // a new belief: the likelihood averages start again
+  }
 
   // Extract pose mean (x, y, yaw) expressed in map frame
   const auto & pose = msg->pose.pose;
@@ -686,9 +699,19 @@ AMCLLocalizer::reinitialize_(
   std::normal_distribution<double> yaw_noise(0.0, yaw_stddev);
 
   const std::size_t N = particles_.size();
+  std::vector<std::size_t> which(N);
+  for (std::size_t i = 0; i < N; ++i) {
+    which[i] = i;
+  }
+  if (hint) {
+    const auto order = by_weight_(N, true);
+    const std::size_t m = std::clamp<std::size_t>(
+      static_cast<std::size_t>(std::lround(fraction * static_cast<double>(N))), 1, N);
+    which.assign(order.end() - m, order.end());
+  }
   std::vector<std::pair<std::size_t, tf2::Transform>> poses;
   poses.reserve(N);
-  for (std::size_t i = 0; i < N; ++i) {
+  for (std::size_t i : which) {
     const double z0 = standard_normal(rng_);
     const double z1 = standard_normal(rng_);
 
@@ -702,11 +725,15 @@ AMCLLocalizer::reinitialize_(
     tf2::Quaternion q_particle;
     q_particle.setRPY(0.0, 0.0, new_yaw);
 
-    poses.emplace_back(i, tf2::Transform(q_particle, tf2::Vector3(new_x, new_y, 0.0)));
+    // At the pose's height: the NavMap places the particle on the surface below it
+    poses.emplace_back(
+      i, tf2::Transform(q_particle, tf2::Vector3(new_x, new_y, pose.position.z)));
 
     particles_[i].hits = 0;
     particles_[i].possible_hits = 0;
-    particles_[i].weight = 1.0 / static_cast<double>(N);
+    if (!hint) {
+      particles_[i].weight = 1.0 / static_cast<double>(N);
+    }
   }
 
   // Normalize particle weights (safety)
@@ -736,11 +763,17 @@ AMCLLocalizer::reinitialize_(
 
   // Prevent immediate reseed after initialization
   last_reseed_ = get_node()->now();
+  if (hint) {
+    RCLCPP_INFO(
+      logger, "AMCLLocalizer: %zu particles drawn around the hint (%.3f, %.3f, %.3f)",
+      which.size(), mean_x, mean_y, mean_yaw);
+    return;
+  }
 
   // map->basefootprint: the requested pose (the particles take it in the RT thread)
   tf2::Quaternion q_mean;
   q_mean.setRPY(0.0, 0.0, mean_yaw);
-  tf2::Transform map2bf(q_mean, tf2::Vector3(mean_x, mean_y, 0.0));
+  tf2::Transform map2bf(q_mean, tf2::Vector3(mean_x, mean_y, pose.position.z));
 
   // Publish TF if odom transform is already known
   if (initialized_odom_) {
@@ -772,7 +805,8 @@ void AMCLLocalizer::update_odom_from_tf()
   }
   tf2::fromMsg(tf_msg.transform, odom_);
   last_input_time_ = tf_msg.header.stamp;
-  initialized_odom_ = true;
+  // The first odometry is where the motion is counted from (as in odom_callback)
+  if (!initialized_odom_) {last_odom_ = odom_; initialized_odom_ = true;}
 }
 
 std::optional<tf2::Quaternion> get_latest_imu_quat(const NavState & nav_state)
@@ -795,11 +829,35 @@ void AMCLLocalizer::update_rt(NavState & nav_state)
 
 void AMCLLocalizer::update(NavState & nav_state)
 {
+  // A pose handed over by a plugin hosting this one: each new stamp is a new reset
+  if (nav_state.has("localizer.reset_pose")) {
+    const auto & reset =
+      nav_state.get<geometry_msgs::msg::PoseWithCovarianceStamped>("localizer.reset_pose");
+    const rclcpp::Time stamp(reset.header.stamp, RCL_ROS_TIME);
+    if (stamp > last_reset_stamp_) {
+      last_reset_stamp_ = stamp;
+      reinitialize_(reset, true);
+    }
+  }
+  if (nav_state.has("localizer.pose_hint")) {
+    const auto & hint =
+      nav_state.get<geometry_msgs::msg::PoseWithCovarianceStamped>("localizer.pose_hint");
+    const rclcpp::Time stamp(hint.header.stamp, RCL_ROS_TIME);
+    if (stamp > last_hint_stamp_) {
+      last_hint_stamp_ = stamp;
+      reinitialize_(hint, true, std::clamp(hint_fraction_, 0.0, 0.99));
+    }
+  }
+
   correct(nav_state);
   if ((get_node()->now() - last_reseed_).seconds() > reseed_time_) {
     reseed(); last_reseed_ = get_node()->now();
   }
   nav_state.set("robot_pose", get_pose());
+  nav_state.set("localizer.quality", quality_);
+  nav_state.set("localizer.accepts_hint", true);
+  nav_state.set("localizer.accepts_fit", true);
+  answer_fit_(nav_state);
   publishParticles();
 }
 
@@ -913,14 +971,6 @@ void AMCLLocalizer::predict(NavState & nav_state)
 }
 
 // ---------- perception scoring helpers ----------
-struct SensorBundle
-{
-  std::string frame_id;
-  rclcpp::Time stamp;
-  tf2::Transform T_bf_sensor;            // the sensor when it saw the cloud, in today's footprint
-  pcl::PointCloud<pcl::PointXYZ> cloud;  // in sensor frame
-};
-
 static inline std::string get_frame_id_from(const PointPerception & pp)
 {
   // Prefer pcl header frame_id; fallback to pp.frame_id if available
@@ -997,6 +1047,55 @@ static ScoreAgg score_particle_sensor_cloud(
   }
 
   return s;
+}
+
+void AMCLLocalizer::answer_fit_(NavState & nav_state)
+{
+  // How well the clouds correct() last scored fit the map at each pose asked (the fraction of
+  // their hits, as the particles are scored): the hosting plugin compares poses with it
+  if (!nav_state.has("localizer.fit_poses") || fit_bundles_.empty() ||
+    !nav_state.has("map.bonxai") || !nav_state.has("map.bonxai.inflated"))
+  {
+    return;
+  }
+  const auto & req = nav_state.get<geometry_msgs::msg::PoseArray>("localizer.fit_poses");
+  const rclcpp::Time stamp(req.header.stamp, RCL_ROS_TIME);
+  if (stamp <= last_fit_stamp_) {
+    return;
+  }
+  last_fit_stamp_ = stamp;
+  // Where the robot would be now (the odometry at the last prediction) had it been at each
+  // pose when they were taken
+  tf2::Transform since = tf2::Transform::getIdentity();
+  const auto tf_info = RTTFBuffer::getInstance()->get_tf_info();
+  try {
+    const auto msg = RTTFBuffer::getInstance()->lookupTransform(
+      tf_info.robot_footprint_frame, tf2_ros::fromRclcpp(stamp), tf_info.robot_footprint_frame,
+      tf2_ros::fromRclcpp(last_input_time_), tf_info.odom_frame, tf2::durationFromSec(0.0));
+    tf2::fromMsg(msg.transform, since);
+  } catch (const tf2::TransformException &) {
+  }
+  const auto & original_map = nav_state.get_ptr<Bonxai::ProbabilisticMap>("map.bonxai");
+  const auto & inflated_map = nav_state.get_ptr<Bonxai::ProbabilisticMap>("map.bonxai.inflated");
+  std_msgs::msg::Float64MultiArray out;
+  out.data.reserve(req.poses.size() + 1);
+  out.data.push_back(stamp.seconds());
+  for (const auto & p : req.poses) {
+    tf2::Transform pose;
+    tf2::fromMsg(p, pose);
+    pose = pose * since;
+    float hits = 0.0f, possible = 0.0f;
+    for (const auto & b : fit_bundles_) {
+      if (b.cloud.empty()) {continue;}
+      const ScoreAgg s = score_particle_sensor_cloud(
+        pose, b.cloud, b.T_bf_sensor, *original_map, *inflated_map, fit_tail_skip_);
+      hits += s.hits; possible += s.possible;
+    }
+    out.data.push_back(
+      possible > 0.0f ? static_cast<double>(hits / possible) :
+      std::numeric_limits<double>::quiet_NaN());
+  }
+  nav_state.set("localizer.fit", out);
 }
 
 // ---------- correct() ----------
@@ -1106,6 +1205,9 @@ void AMCLLocalizer::correct(NavState & nav_state)
     b.cloud.height = 1;
   }
 
+  fit_bundles_ = bundles;      // for the fit queries of a hosting plugin
+  fit_tail_skip_ = TAIL_SKIP;
+
   // Score all particles against all sensors
   bool debug = false;
   std::vector<double> likelihood;
@@ -1126,7 +1228,10 @@ void AMCLLocalizer::correct(NavState & nav_state)
     particle.possible_hits += possible;
     if (possible > 0.0f) {likelihood.push_back(hits / possible);}
   }
-  if (!likelihood.empty()) {update_recovery_(best_mean_(likelihood));}
+  if (!likelihood.empty()) {
+    quality_ = best_mean_(likelihood);
+    update_recovery_(quality_);
+  }
 
   // Weights update with power tau
   for (auto & particle : particles_) {
@@ -1438,6 +1543,7 @@ static inline bool is_finite_tf(const tf2::Transform & T)
 
 void AMCLLocalizer::publishTF(const tf2::Transform & map2bf)
 {
+  if (!publish_tf_) {return;}
   if (!is_finite_tf(map2bf)) {
     RCLCPP_ERROR(get_node()->get_logger(), "publishTF: invalid transform");
     return;
